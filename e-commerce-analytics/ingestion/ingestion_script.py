@@ -16,6 +16,10 @@ from datetime import datetime
 from botocore.exceptions import ClientError
 import hashlib
 import json
+from io import BytesIO
+import cProfile
+import pstats
+
 import unicodedata  # For removing accents
 
 
@@ -259,8 +263,12 @@ def validate_record(record, dataset_name):
         if field in schema["field_types"]:
             expected_type = schema["field_types"][field]
 
-            # Skip validation for empty fields
-            if value is None or value == "":
+            # Skip validation for empty fields or None values
+            if (
+                value is None
+                or value == ""
+                or (isinstance(value, str) and value.strip() == "")
+            ):
                 continue
 
             # Validate timestamps
@@ -269,19 +277,19 @@ def validate_record(record, dataset_name):
                 or field.endswith("_date")
                 or field.endswith("_at")
             ):
-                if not validate_timestamp(value):
+                if not validate_timestamp(str(value)):
                     return False, f"Invalid timestamp format for {field}: {value}"
 
             # Validate other types
             elif expected_type == int:
                 try:
                     int(value)
-                except ValueError:
+                except (ValueError, TypeError):
                     return False, f"Field {field} should be integer, got: {value}"
             elif expected_type == float:
                 try:
                     float(value)
-                except ValueError:
+                except (ValueError, TypeError):
                     return False, f"Field {field} should be float, got: {value}"
             elif expected_type == str and not isinstance(value, str):
                 return (
@@ -303,10 +311,6 @@ def check_duplicates(records, key_fields):
 
     for record in records:
         # Normalize fields for hashing
-        # if 'geolocation_lat' in record and 'geolocation_lng' in record:
-        #     record['geolocation_lat'] = round(float(record['geolocation_lat']), 5)
-        #     record['geolocation_lng'] = round(float(record['geolocation_lng']), 5)
-
         if "geolocation_city" in record:
             record["geolocation_city"] = normalize_string(record["geolocation_city"])
 
@@ -321,6 +325,29 @@ def check_duplicates(records, key_fields):
             unique_records.append(record)
 
     return unique_records, duplicate_records
+
+
+def safe_convert_numeric(df, field, expected_type):
+    """Safely convert a column to numeric type with better error handling."""
+    try:
+        if field not in df.columns:
+            return
+
+        # Replace empty strings and whitespace-only strings with NaN first
+        df[field] = df[field].replace(r"^\s*$", pd.NA, regex=True)
+
+        if expected_type == int:
+            # Convert to numeric, coercing errors to NaN
+            df[field] = pd.to_numeric(df[field], errors="coerce")
+        elif expected_type == float:
+            # Convert to numeric, coercing errors to NaN
+            df[field] = pd.to_numeric(df[field], errors="coerce")
+
+    except Exception as e:
+        logger.warning(
+            f"Error converting column {field} to {expected_type.__name__}: {e}"
+        )
+        # Leave the column as-is if conversion fails
 
 
 def process_csv_file(file_path, s3_client):
@@ -343,8 +370,29 @@ def process_csv_file(file_path, s3_client):
 
     try:
         # Read CSV with pandas for better handling of different formats
-        df = pd.read_csv(file_path, low_memory=False)
-        records = df.fillna("").to_dict("records")
+        # Use keep_default_na=False to prevent pandas from converting strings to NaN
+        df = pd.read_csv(
+            file_path, low_memory=False, keep_default_na=False, na_values=[]
+        )
+        schema = SCHEMAS[dataset_name]
+
+        # Safely convert numeric columns
+        for field, expected_type in schema["field_types"].items():
+            if field in df.columns and expected_type in [int, float]:
+                safe_convert_numeric(df, field, expected_type)
+
+        # Convert DataFrame to records, handling None/NaN values properly
+        records = []
+        for _, row in df.iterrows():
+            record = {}
+            for col in df.columns:
+                value = row[col]
+                # Keep NaN/None as None, don't convert to empty string for numeric fields
+                if pd.isna(value):
+                    record[col] = None
+                else:
+                    record[col] = value
+            records.append(record)
 
         # Validate each record
         valid_records = []
@@ -367,7 +415,6 @@ def process_csv_file(file_path, s3_client):
             duplicate_records = []  # No deduplication for geolocation
         else:
             # Check for duplicates among valid records
-            schema = SCHEMAS[dataset_name]
             key_fields = schema["required_fields"]
             unique_records, duplicate_records = check_duplicates(
                 valid_records, key_fields
@@ -387,10 +434,13 @@ def process_csv_file(file_path, s3_client):
 
         # Upload valid records to S3
         if not valid_df.empty:
-            csv_buffer = valid_df.to_csv(index=False)
-            s3_key = f"{RAW_DATA_PREFIX}{dataset_name}/{datetime.now().strftime('%Y-%m-%d')}/{file_name}"
+            buffer = BytesIO()
+            valid_df.to_parquet(buffer, index=False, engine="pyarrow")
+            buffer.seek(0)
 
-            s3_client.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=csv_buffer)
+            s3_key = f"{RAW_DATA_PREFIX}{dataset_name}/{datetime.now().strftime('%Y-%m-%d')}/{file_name.replace('.csv', '.parquet')}"
+
+            s3_client.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=buffer.getvalue())
             logger.info(
                 f"Uploaded {len(unique_records)} valid records to s3://{S3_BUCKET}/{s3_key}"
             )
@@ -399,13 +449,12 @@ def process_csv_file(file_path, s3_client):
         if invalid_df is not None and not invalid_df.empty:
             csv_buffer = invalid_df.to_csv(index=False)
             s3_key = f"{QUARANTINE_PREFIX}{dataset_name}/{datetime.now().strftime('%Y-%m-%d')}/{file_name}"
-
             s3_client.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=csv_buffer)
             logger.info(
                 f"Quarantined {len(invalid_records)} invalid records to s3://{S3_BUCKET}/{s3_key}"
             )
 
-        # Generate report
+        # Generate and upload report
         report = {
             "file_name": file_name,
             "dataset_name": dataset_name,
@@ -420,10 +469,7 @@ def process_csv_file(file_path, s3_client):
             "timestamp": datetime.now().isoformat(),
         }
 
-        # Upload report
-        s3_key = (
-            f"reports/{dataset_name}/{datetime.now().strftime('%Y-%m-%d')}/report.json"
-        )
+        s3_key = f"reports/ingestion_reports/{dataset_name}/{datetime.now().strftime('%Y-%m-%d')}/report.json"
         s3_client.put_object(
             Bucket=S3_BUCKET, Key=s3_key, Body=json.dumps(report, indent=2)
         )
@@ -487,4 +533,10 @@ def main():
 
 
 if __name__ == "__main__":
+    profiler = cProfile.Profile()
+    profiler.enable()
     main()
+    profiler.disable()
+    stats = pstats.Stats(profiler).sort_stats("cumtime")
+    stats.print_stats(20)  # Print top 20 functions by cumulative time
+    # stats.dump_stats("profiling_report.prof") # Save to a file for more detailed analysis with snakeviz

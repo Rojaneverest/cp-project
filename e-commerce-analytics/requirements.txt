@@ -8,14 +8,18 @@ boto3
 # daphne==3.0.2
 
 # # Data Processing
-# pyspark==3.2.0
+pyspark==3.5.1
 
 # delta-spark==1.1.0
 
 # # Database
 # psycopg2-binary==2.9.3
 # sqlalchemy==1.4.36
-
+sqlalchemy
+psycopg2-binary
+dotenv
+pyarrow 
+fastparquet
 # # Airflow
 # apache-airflow==2.3.0
 # apache-airflow-providers-postgres==2.4.0
